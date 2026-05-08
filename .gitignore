@@ -1,0 +1,22 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Config local (contém credenciais)
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Planilhas de dados
+*.xlsx
+*.xls
+
+# IDEs
+.vscode/
+.idea/
