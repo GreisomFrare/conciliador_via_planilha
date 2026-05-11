@@ -240,7 +240,7 @@ class ConciliacaoCartaoApp:
                  'Dt. Vencto', 'Dt. Crédito')
     _WIDS_DIR = (38, 50, 72, 80, 120, 42, 62, 85, 72, 85, 52, 82, 82)
 
-    _SHOW_DIR = [0, 0, 3, 4, 5, 8, 6, 10, 11, 12, 13, 14, 16]
+    _SHOW_DIR = [17, 0, 3, 4, 5, 8, 6, 10, 11, 12, 13, 14, 16]
     _NUM_DIR  = {10, 11, 12, 13}
 
     def __init__(self, root: tk.Tk):
@@ -257,6 +257,8 @@ class ConciliacaoCartaoApp:
         self._all_items_dir: list = []
         self._sort_esq: dict = {}
         self._sort_dir: dict = {}
+        self._dir_item_raw: dict = {}
+        self._pending_erp_edits: dict = {}
 
         self._setup_style()
         self._build_ui()
@@ -336,7 +338,7 @@ class ConciliacaoCartaoApp:
                         variable=self._crit_nsu).pack(side=tk.LEFT, padx=10)
         ttk.Checkbutton(crit_row, text='Autorização',
                         variable=self._crit_aut).pack(side=tk.LEFT, padx=10)
-        ttk.Checkbutton(crit_row, text='Dt. Pagamento = Dt. Crédito',
+        ttk.Checkbutton(crit_row, text='Dt. Venda = Dt. Crédito',
                         variable=self._crit_data_venda).pack(side=tk.LEFT, padx=10)
         ttk.Checkbutton(crit_row, text='Valor Bruto = Vlr Parcela',
                         variable=self._crit_valor).pack(side=tk.LEFT, padx=10)
@@ -371,11 +373,23 @@ class ConciliacaoCartaoApp:
         self._tree_dir = self._build_grid(
             lf_dir,
             self._COLS_DIR, self._HDRS_DIR, self._WIDS_DIR,
-            [('conciliado', '#90EE90'),
-             ('pendente',   '#ADD8E6'),
-             ('nomatch',    '#FFFACD')],
+            [('conciliado',  '#90EE90'),
+             ('pendente',    '#ADD8E6'),
+             ('nomatch',     '#FFFACD'),
+             ('erp_editado', '#FFE0A0')],
             '_dir',
         )
+        self._tree_dir.bind('<Double-1>', self._on_erp_double_click)
+
+        frm_erp_btns = ttk.Frame(lf_dir)
+        frm_erp_btns.pack(fill=tk.X, padx=4, pady=(0, 2))
+        self._btn_salvar_erp = ttk.Button(
+            frm_erp_btns, text='Salvar Alterações ERP',
+            command=self._cmd_salvar_erp, state='disabled'
+        )
+        self._btn_salvar_erp.pack(side=tk.LEFT, padx=4)
+        self._lbl_erp_pendentes = ttk.Label(frm_erp_btns, text='', foreground='darkorange')
+        self._lbl_erp_pendentes.pack(side=tk.LEFT)
 
         frm_tot = ttk.Frame(parent)
         frm_tot.pack(fill=tk.X, padx=5, pady=2)
@@ -509,8 +523,8 @@ class ConciliacaoCartaoApp:
                   if (ft := fv.get().strip().lower())]
 
         if active:
-            items = [(v, t) for v, t in master
-                     if all(ft in str(v[i]).lower() for i, ft in active)]
+            items = [it for it in master
+                     if all(ft in str(it[0][i]).lower() for i, ft in active)]
         else:
             items = list(master)
 
@@ -524,14 +538,20 @@ class ConciliacaoCartaoApp:
             arrow = (' ▲' if sort.get('asc', True) else ' ▼') if c == sort_col else ''
             tree.heading(c, text=h + arrow)
 
-        self._bulk_fill(tree, vsb, xss, items)
+        raw_map = self._dir_item_raw if side == '_dir' else None
+        self._bulk_fill(tree, vsb, xss, items, raw_map)
 
-    def _bulk_fill(self, tree, vsb, xscrollset, items: list):
+    def _bulk_fill(self, tree, vsb, xscrollset, items: list, item_raw_map: dict = None):
         tree.configure(yscrollcommand='', xscrollcommand='')
         tree.delete(*tree.get_children())
+        if item_raw_map is not None:
+            item_raw_map.clear()
         try:
-            for vals, tag in items:
-                tree.insert('', 'end', values=vals, tags=(tag,))
+            for it in items:
+                vals, tag = it[0], it[1]
+                iid = tree.insert('', 'end', values=vals, tags=(tag,))
+                if item_raw_map is not None and len(it) > 2:
+                    item_raw_map[iid] = it[2]
         finally:
             tree.configure(yscrollcommand=vsb.set, xscrollcommand=xscrollset)
 
@@ -883,7 +903,8 @@ class ConciliacaoCartaoApp:
                 self._set_status('Buscando lançamentos no ERP…')
                 self.db.connect()
                 _, rows = self.db.get_acercar_records(
-                    dt_ini, dt_fim, estab, crit, de_para)
+                    dt_ini, dt_fim, estab, crit, de_para,
+                    id_arquivo=self.current_id_arquivo)
             except Exception as exc:
                 messagebox.showerror('Erro', str(exc))
                 self._set_status('Erro ao buscar lançamentos.')
@@ -893,8 +914,8 @@ class ConciliacaoCartaoApp:
 
             items  = []
             n_conc = n_match = n_no = 0
+            vlr_conc_dir = 0.0
             for row in rows:
-                n_no += 1
                 vals = []
                 for idx in SHOW:
                     v = row[idx]
@@ -904,13 +925,22 @@ class ConciliacaoCartaoApp:
                         vals.append(_fmt(v) or '1')
                     else:
                         vals.append(_fmt(v))
-                vals[0] = ''
-                items.append((vals, 'nomatch'))
+                if vals[0] == 'S':
+                    n_conc += 1
+                    vlr_conc_dir += _br_to_float(vals[7])
+                    tag = 'conciliado'
+                else:
+                    vals[0] = ''
+                    n_no += 1
+                    tag = 'nomatch'
+                items.append((vals, tag, row))
 
             total = len(items)
-            vlr_conc_dir = 0.0
+            self._pending_erp_edits.clear()
 
             def update_ui():
+                self._btn_salvar_erp.configure(state='disabled')
+                self._lbl_erp_pendentes.configure(text='')
                 self._load_dir(items)
                 self._tot_erp.set(str(total))
                 self._tot_erp_conc.set(str(n_conc))
@@ -1039,7 +1069,9 @@ class ConciliacaoCartaoApp:
             if can_erp:
                 try:
                     self.db.connect()
-                    _, rows_dir = self.db.get_acercar_records(dt_ini, dt_fim, estab, crit, de_para)
+                    _, rows_dir = self.db.get_acercar_records(
+                        dt_ini, dt_fim, estab, crit, de_para,
+                        id_arquivo=self.current_id_arquivo)
                 except Exception as exc:
                     messagebox.showerror('Erro ao recarregar ERP', str(exc))
                     rows_dir = []
@@ -1048,7 +1080,6 @@ class ConciliacaoCartaoApp:
 
                 items_dir = []
                 for row in rows_dir:
-                    n_no += 1
                     vals = []
                     for idx in SHOW:
                         v = row[idx]
@@ -1058,9 +1089,15 @@ class ConciliacaoCartaoApp:
                             vals.append(_fmt(v) or '1')
                         else:
                             vals.append(_fmt(v))
-                    vals[0] = ''
-                    items_dir.append((vals, 'nomatch'))
-                vlr_conc_dir = 0.0
+                    if vals[0] == 'S':
+                        n_conc += 1
+                        vlr_conc_dir += _br_to_float(vals[7])
+                        tag = 'conciliado'
+                    else:
+                        vals[0] = ''
+                        n_no += 1
+                        tag = 'nomatch'
+                    items_dir.append((vals, tag, row))
 
             def update_ui():
                 self._load_esq(items_esq)
@@ -1134,6 +1171,111 @@ class ConciliacaoCartaoApp:
 
         ttk.Button(btn_frm, text='Copiar SQL', command=_copy).pack(side=tk.LEFT, padx=6)
         ttk.Button(btn_frm, text='Fechar', command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+    def _on_erp_double_click(self, event):
+        tree = self._tree_dir
+        item = tree.identify_row(event.y)
+        col  = tree.identify_column(event.x)
+        if not item or not col:
+            return
+        col_idx = int(col[1:]) - 1  # '#3' → 2 (0-based)
+
+        # Apenas NSU/DOC (col 2) e Autorização (col 3) são editáveis
+        if col_idx not in (2, 3):
+            return
+
+        raw = self._dir_item_raw.get(item)
+        if not raw:
+            return
+
+        # COLS_ERP: NSUDOC = índice 3, AUTORIZA = índice 4
+        if col_idx == 2:
+            orig_val = raw[3]
+            field    = 'nsudoc'
+        else:
+            orig_val = raw[4]
+            field    = 'autoriza'
+
+        # Só permite editar se o valor original no ERP está vazio/nulo
+        if orig_val and str(orig_val).strip():
+            return
+
+        bbox = tree.bbox(item, self._COLS_DIR[col_idx])
+        if not bbox:
+            return
+        x, y, w, h = bbox
+
+        entry_var = tk.StringVar(value=tree.set(item, self._COLS_DIR[col_idx]))
+        entry = ttk.Entry(tree, textvariable=entry_var, font=('Arial', 8))
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.focus_set()
+        entry.select_range(0, 'end')
+
+        committed = [False]
+
+        def _commit(_=None):
+            if committed[0]:
+                return
+            committed[0] = True
+            new_val = entry_var.get().strip()
+            entry.destroy()
+            if not new_val:
+                return
+            tree.set(item, self._COLS_DIR[col_idx], new_val)
+            # Atualiza _all_items_dir in-place para preservar edição após filtros
+            for i, it in enumerate(self._all_items_dir):
+                if len(it) > 2 and it[2] is raw:
+                    new_vals = list(it[0])
+                    new_vals[col_idx] = new_val
+                    self._all_items_dir[i] = (tuple(new_vals), 'erp_editado', it[2])
+                    break
+            tree.item(item, tags=('erp_editado',))
+            # Registra edição pendente
+            key = (raw[0], raw[1], raw[2])  # estab, idacerfin, idacercar
+            if key not in self._pending_erp_edits:
+                self._pending_erp_edits[key] = {
+                    'estab': raw[0], 'idacerfin': raw[1], 'idacercar': raw[2]
+                }
+            self._pending_erp_edits[key][field] = new_val
+            n = len(self._pending_erp_edits)
+            self._btn_salvar_erp.configure(state='normal')
+            self._lbl_erp_pendentes.configure(text=f'{n} alteração(ões) pendente(s)')
+
+        entry.bind('<Return>',   _commit)
+        entry.bind('<Tab>',      _commit)
+        entry.bind('<FocusOut>', _commit)
+        entry.bind('<Escape>',   lambda _: entry.destroy())
+
+    def _cmd_salvar_erp(self):
+        if not self._pending_erp_edits:
+            return
+        edits   = list(self._pending_erp_edits.values())
+        n_edits = len(edits)
+        if not messagebox.askyesno(
+            'Confirmar',
+            f'Salvar {n_edits} alteração(ões) no ERP (tabela ACERCAR)?\n\n'
+            'Apenas campos atualmente vazios/nulos serão atualizados.\n'
+            'Campos já preenchidos não serão modificados.'
+        ):
+            return
+
+        def run():
+            try:
+                self._set_status('Salvando alterações no ERP…')
+                self.db.connect()
+                n = self.db.update_acercar_nsu_autoriza(edits)
+                self._pending_erp_edits.clear()
+                self._set_status(f'{n} campo(s) atualizado(s) no ERP.')
+                messagebox.showinfo('Salvo', f'{n} campo(s) atualizado(s) no ERP (ACERCAR).')
+                self.root.after(0, lambda: self._btn_salvar_erp.configure(state='disabled'))
+                self.root.after(0, lambda: self._lbl_erp_pendentes.configure(text=''))
+            except Exception as exc:
+                messagebox.showerror('Erro ao salvar no ERP', str(exc))
+                self._set_status('Erro ao salvar no ERP.')
+            finally:
+                self.db.disconnect()
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _cmd_salvar_config(self):
         cfg = load_config()

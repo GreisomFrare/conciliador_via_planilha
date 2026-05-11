@@ -32,12 +32,14 @@ CREATE TABLE CONCILIACAOCARTAO (
 """
 
 # Colunas retornadas pelo SQL do ERP (mesma ordem do SELECT)
+# índice 17 = EXISTENOARQ: 'S' se existe registro conciliado na CONCILIACAOCARTAO, 'N' caso contrário
 COLS_ERP = [
     'ESTAB', 'IDACERFIN', 'IDACERCAR', 'NSUDOC', 'AUTORIZA',
     'IDCARTAO', 'PARCELAS', 'VALOR',
     'PARCELA', 'IDLANFIN',
     'VLRPARC', 'VLRTAXA', 'VLRL', 'TAXA',
     'DTVENCTO', 'DTBAIXA', 'DATACREDITO',
+    'EXISTENOARQ',
 ]
 
 
@@ -90,6 +92,22 @@ def get_connection(cfg: dict):
     return oracledb.connect(**connect_kwargs)
 
 
+def _build_estab_filter(de_para: dict, estab: str) -> tuple:
+    """
+    Monta o filtro de estabelecimento para o EXISTS do conciliar().
+    Com de-para: CASE CC.ESTABELECIMENTO → ERP estab correto por registro.
+    Sem de-para: fallback para :estab (bind param).
+    Retorna (sql_fragment, use_param_estab).
+    """
+    if de_para:
+        cases = ' '.join(
+            f"WHEN '{cielo}' THEN {int(erp)}"
+            for cielo, erp in de_para.items()
+        )
+        return f"X.ESTAB = CASE CC.ESTABELECIMENTO {cases} ELSE NULL END", False
+    return "X.ESTAB = :estab", True
+
+
 def _build_case_criteria(criteria: dict, de_para: dict, estab: str,
                          conciliado_only: bool = False) -> str:
     """Monta as condições do EXISTS dentro do CASE WHEN."""
@@ -99,7 +117,7 @@ def _build_case_criteria(criteria: dict, de_para: dict, estab: str,
     if criteria.get('autorizacao'):
         conditions.append('CC.AUTORIZACAO = X.AUTORIZA')
     if criteria.get('data_venda'):
-        conditions.append('CC.DATA_PAGAMENTO = A.DATA')
+        conditions.append('CC.DATA_VENDA = A.DATA')
     if criteria.get('valor_bruto'):
         variacao = float(criteria.get('variacao') or 0)
         if variacao > 0:
@@ -107,9 +125,11 @@ def _build_case_criteria(criteria: dict, de_para: dict, estab: str,
         else:
             conditions.append('CC.VALOR_BRUTO = X1.VALOR')
     if criteria.get('estab') and de_para:
-        cielo_codes = [c for c, e in de_para.items() if str(e) == str(estab)]
-        if cielo_codes:
-            quoted = ', '.join(f"'{c}'" for c in cielo_codes)
+        # Exige que o código Cielo esteja no de-para (o ERP já é garantido pelo _build_estab_filter).
+        # Usar todos os códigos Cielo do de-para, não só os do estab configurado.
+        all_cielo_codes = list(de_para.keys())
+        if all_cielo_codes:
+            quoted = ', '.join(f"'{c}'" for c in all_cielo_codes)
             conditions.append(f"CC.ESTABELECIMENTO IN ({quoted})")
         else:
             conditions.append('1=0')
@@ -227,8 +247,45 @@ class DatabaseManager:
                             data_fim_str: str,
                             estab: str = None,
                             criteria: dict = None,
-                            de_para: dict = None):
-        sql = """
+                            de_para: dict = None,
+                            id_arquivo: str = None):
+        params = {}
+
+        # Subquery correlacionada: verifica se cada linha do ERP tem um registro
+        # conciliado correspondente em CONCILIACAOCARTAO (mesmo critério do UPDATE).
+        existenoarq_expr = "'N'"
+        if id_arquivo and criteria:
+            case_crit = _build_case_criteria(
+                criteria, de_para or {}, estab or '', conciliado_only=True
+            )
+            if case_crit != '1=0':
+                existenoarq_expr = (
+                    "CASE WHEN EXISTS ("
+                    "SELECT 1 FROM CONCILIACAOCARTAO CC "
+                    f"WHERE CC.ID_ARQUIVO = :id_arquivo AND {case_crit}"
+                    ") THEN 'S' ELSE 'N' END"
+                )
+                params['id_arquivo'] = id_arquivo
+
+        # Quando há arquivo carregado, filtra apenas pelas datas de venda presentes
+        # na planilha — evita varredura ampla de datas que traria ~400K registros.
+        if id_arquivo:
+            date_filter = (
+                "A.DATA IN ("
+                "SELECT DISTINCT DATA_VENDA FROM CONCILIACAOCARTAO "
+                "WHERE ID_ARQUIVO = :id_arquivo_dt AND DATA_VENDA IS NOT NULL"
+                ")"
+            )
+            params['id_arquivo_dt'] = id_arquivo
+        else:
+            date_filter = (
+                "A.DATA BETWEEN TO_DATE(:data_inicio, 'DD/MM/YYYY') "
+                "AND TO_DATE(:data_fim, 'DD/MM/YYYY')"
+            )
+            params['data_inicio'] = data_ini_str
+            params['data_fim']    = data_fim_str
+
+        sql = f"""
             SELECT
                 X.ESTAB, X.IDACERFIN, X.IDACERCAR, X.NSUDOC, X.AUTORIZA,
                 X.IDCARTAO, X.QTDEPARCELAS AS PARCELAS, X.VALOR AS VALOR,
@@ -237,21 +294,16 @@ class DatabaseManager:
                 X1.VALOR - COALESCE(X1.TXADM, 0) AS VLRL,
                 COALESCE(X1.TXADMP, 0) AS TAXA,
                 X1.DTVENCTO, X1.DTBAIXA,
-                A.DATA AS DATACREDITO
+                A.DATA AS DATACREDITO,
+                {existenoarq_expr} AS EXISTENOARQ
             FROM ACERCAR X
                 INNER JOIN ACERCARDET X1
                     ON (X.ESTAB = X1.ESTAB AND X.IDACERFIN = X1.IDACERFIN AND X.IDACERCAR = X1.IDACERCAR)
                 INNER JOIN ACERFIN A
                     ON (X1.ESTAB = A.ESTAB AND X1.IDACERFIN = A.IDACERFIN)
-            WHERE A.DATA BETWEEN TO_DATE(:data_inicio, 'DD/MM/YYYY')
-                             AND TO_DATE(:data_fim,    'DD/MM/YYYY')
+            WHERE {date_filter}
             ORDER BY X.ESTAB, X1.SEQPARC, X.IDACERFIN
         """
-
-        params = {
-            'data_inicio': data_ini_str,
-            'data_fim':    data_fim_str,
-        }
 
         cursor = self.connection.cursor()
         try:
@@ -273,6 +325,8 @@ class DatabaseManager:
         if case_criteria == '1=0':
             return 0
 
+        estab_filter, needs_estab_param = _build_estab_filter(de_para, estab)
+
         sql = f"""
             UPDATE CONCILIACAOCARTAO CC
             SET CC.CONCILIADO = 'S'
@@ -289,7 +343,7 @@ class DatabaseManager:
                       ON (X1.ESTAB = A.ESTAB
                           AND X1.IDACERFIN = A.IDACERFIN)
                   WHERE {case_criteria}
-                    AND X.ESTAB = :estab
+                    AND {estab_filter}
                     AND A.DATA BETWEEN TO_DATE(:data_inicio, 'DD/MM/YYYY')
                                    AND TO_DATE(:data_fim,    'DD/MM/YYYY')
               )
@@ -297,10 +351,11 @@ class DatabaseManager:
 
         params = {
             'id_arquivo':  id_arquivo,
-            'estab':       int(estab) if estab else 1003,
             'data_inicio': data_ini_str,
             'data_fim':    data_fim_str,
         }
+        if needs_estab_param:
+            params['estab'] = int(estab) if estab else 1003
 
         cursor = self.connection.cursor()
         try:
@@ -323,6 +378,9 @@ class DatabaseManager:
         case_criteria = _build_case_criteria(criteria, de_para, estab)
         estab_int = int(estab) if estab else 1003
 
+        estab_filter, needs_estab_param = _build_estab_filter(de_para, estab)
+        estab_filter_resolved = f"X.ESTAB = {estab_int}" if needs_estab_param else estab_filter
+
         sql_resolved = f"""-- ===== DEBUG SQL CONCILIAÇÃO =====
 -- Critérios ativos: {criteria}
 -- De-Para: {de_para}
@@ -344,11 +402,44 @@ WHERE CC.ID_ARQUIVO = '{id_arquivo}'
           ON (X1.ESTAB = A.ESTAB
               AND X1.IDACERFIN = A.IDACERFIN)
       WHERE {case_criteria}
-        AND X.ESTAB = {estab_int}
+        AND {estab_filter_resolved}
         AND A.DATA BETWEEN TO_DATE('{data_ini_str}', 'DD/MM/YYYY')
                        AND TO_DATE('{data_fim_str}', 'DD/MM/YYYY')
   )"""
         return sql_resolved
+
+    def update_acercar_nsu_autoriza(self, edits: list) -> int:
+        """
+        edits: lista de dicts com chaves estab, idacerfin, idacercar e opcionalmente nsudoc/autoriza.
+        WHERE garante que só atualiza campos atualmente nulos/vazios no ERP.
+        """
+        cursor = self.connection.cursor()
+        total = 0
+        try:
+            for edit in edits:
+                base = {
+                    'estab':     edit['estab'],
+                    'idacerfin': edit['idacerfin'],
+                    'idacercar': edit['idacercar'],
+                }
+                if 'nsudoc' in edit:
+                    cursor.execute("""
+                        UPDATE ACERCAR SET NSUDOC = :nsudoc
+                        WHERE ESTAB = :estab AND IDACERFIN = :idacerfin AND IDACERCAR = :idacercar
+                          AND (NSUDOC IS NULL OR TRIM(NSUDOC) = ' ' OR TRIM(NSUDOC) = '')
+                    """, {**base, 'nsudoc': edit['nsudoc']})
+                    total += cursor.rowcount
+                if 'autoriza' in edit:
+                    cursor.execute("""
+                        UPDATE ACERCAR SET AUTORIZA = :autoriza
+                        WHERE ESTAB = :estab AND IDACERFIN = :idacerfin AND IDACERCAR = :idacercar
+                          AND (AUTORIZA IS NULL OR TRIM(AUTORIZA) = ' ' OR TRIM(AUTORIZA) = '')
+                    """, {**base, 'autoriza': edit['autoriza']})
+                    total += cursor.rowcount
+            self.connection.commit()
+            return total
+        finally:
+            cursor.close()
 
     def desfazer_conciliacao(self, id_arquivo: str) -> int:
         cursor = self.connection.cursor()
